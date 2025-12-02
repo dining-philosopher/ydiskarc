@@ -49,7 +49,7 @@ def cli2():
 @cli2.command()
 @click.option('--url', '-u', default=None, help='URL of the public resource to process')
 @click.option('--output', '-o', default=None, help='Output path')
-@click.option('--update', '-u', is_flag=True, help='Update only')
+@click.option('--update', '-d', is_flag=True, help='Update only')
 @click.option('--nofiles', '-n', is_flag=True, help='Files not stored, only metadata collected')
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output. Print additional info')
 def sync(url, output, update, nofiles, verbose):
@@ -59,8 +59,8 @@ def sync(url, output, update, nofiles, verbose):
     if url is None:
         print('Public resource URL required')
         return
-    if output is None:
-        output = url.rsplit('/d/', 1)[-1]
+    # if output is None:
+    #     output = url.rsplit('/d/', 1)[-1].replace("\"","-")
     acmd = Project()
     acmd.sync(url, output, update, nofiles)
     pass
