@@ -6,7 +6,7 @@ import os.path
 import json
 import re
 from os.path import expanduser
-import shutil
+# import shutil
 from rich.progress import Progress, TextColumn
 
 from urllib.parse import unquote
