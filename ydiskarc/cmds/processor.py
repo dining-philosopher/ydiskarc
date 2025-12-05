@@ -5,17 +5,20 @@ import requests
 import os.path
 import json
 import re
-from os.path import expanduser
+# from os.path import expanduser
 # import shutil
 from rich.progress import Progress, TextColumn
 
 from urllib.parse import unquote
 import hashlib
+import time, os
+from datetime import datetime
 
 
-# TODO: дату изменения менять на правильную?
+
 # TODO: многопоточность и шоп целиком завершалось по первому требованию! и шоп не висло после сна!
 # TODO: шоп не вываливалось целиком ежели не получилось скачать один файл! а записывало это в лог
+# TODO: докачка и проверка того, что докачалось?
 
 
 
@@ -28,22 +31,45 @@ REQUEST_HEADER = None
 # DEFAULT_CHUNK_SIZE = 32765
 DEFAULT_CHUNK_SIZE = 1024768
 
+GET_TIMEOUT = 10
+
+
+
+gotten_files = 0
+gotten_dirs = 0
+already_files = 0
+again_files = 0
+error_files = []
+error_dirs = []
+
+
 def url_to_dir_list(path):
     return [i.rstrip().replace("\"","-") for i in path.split('/')] # somehow in yandex disk there may be quotes in file names!!!1
 
+def set_file_date(fn, datestring):
+    date = datetime.strptime(datestring, "%Y-%m-%dT%H:%M:%S%z")
+    modTime = time.mktime(date.timetuple())
+    os.utime(fn, (modTime, modTime))
 
-def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2path=None, makedirs=True, filesize=None):
+
+def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2path=None, makedirs=True, filesize=None, filedate = None):
+    global gotten_files, error_files
     progress = Progress(TextColumn("[progress.description]{task.description}"),)
     if filesize is not None:
         task1 = progress.add_task("[green]Downloading...", total=int(filesize))
     msg = 'Retrieving file from %s' % (url) if filesize is None else 'Retrieving file from %s with size %d' % (url, filesize)
     logging.info(msg)
-    if params:
-        # print(f"page = requests.get(\"{url}\", {params}, headers={REQUEST_HEADER}, stream=True, verify=True)")
-        page = requests.get(url, params, headers=REQUEST_HEADER, stream=True, verify=True)
-    else:
-        # print(f"page = requests.get(\"{url}\", headers={REQUEST_HEADER}, stream=True, verify=True)")
-        page = requests.get(url, headers=REQUEST_HEADER, stream=True, verify=True)
+    try:
+        if params:
+            # print(f"page = requests.get(\"{url}\", {params}, headers={REQUEST_HEADER}, stream=True, verify=True)")
+            page = requests.get(url, params, headers=REQUEST_HEADER, stream=True, verify=True, timeout = GET_TIMEOUT)
+        else:
+            # print(f"page = requests.get(\"{url}\", headers={REQUEST_HEADER}, stream=True, verify=True)")
+            page = requests.get(url, headers=REQUEST_HEADER, stream=True, verify=True, timeout = GET_TIMEOUT)
+    except Exception as e:
+        logging.warning(f"Connection error {e.__class__} getting {filename}")
+        error_files += [(url, filepath, filename, e.__class__)]
+        return
     
     if filename is None:
         if "Content-Disposition" in page.headers.keys():
@@ -60,6 +86,7 @@ def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2p
     
     if page.status_code != requests.status_codes.codes.ALL_OK:
         logging.warning(f"Error {page.status_code} getting {filename} : {page.text} : {page.reason}")
+        error_files += [(url, filepath, filename, page.status_code, page.text, page.reason)]
         return
     
     if not aria2:
@@ -68,21 +95,30 @@ def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2p
         f = open(filename_tmp, 'wb')
         total = 0
         chunk = 0
-        for line in page.iter_content(chunk_size=DEFAULT_CHUNK_SIZE):
-            chunk += 1
-            if line:
-                f.write(line)
-            total += len(line)
-            if filesize is not None:
-#               logging.debug('File %s to size %d' % (filename, total))               
-                progress.update(task1, advance=len(line))
-            if chunk % 1000 == 0:
-                logging.debug('File %s to size %d' % (filename, total))
-                # print(".", end = "")
-                pass
+        try:
+            for line in page.iter_content(chunk_size=DEFAULT_CHUNK_SIZE):
+                chunk += 1
+                if line:
+                    f.write(line)
+                total += len(line)
+                if filesize is not None:
+    #               logging.debug('File %s to size %d' % (filename, total))               
+                    progress.update(task1, advance=len(line))
+                if chunk % 1000 == 0:
+                    logging.debug('File %s to size %d' % (filename, total))
+                    # print(".", end = "")
+                    pass
+        except Exception as e:
+            logging.warning(f"Connection error {e} getting {filename}")
+            error_files += [(url, filepath, filename, e.__class__)]
+            return
         f.close()
         os.replace(filename_tmp, filename)
+        if filedate:
+            set_file_date(filename, filedate)
+        
         logging.info('Saved %s' % filename)
+        gotten_files += 1
     else:
         dirpath = os.path.dirname(filename)
         basename = os.path.basename(filename)
@@ -99,11 +135,11 @@ def yd_get_full(url, output, filename, metadata):
         output = output.replace("\"","-")
         os.makedirs(output, exist_ok=True)
     if metadata and output:
-        resp = requests.get(YD_API, params={'public_key': url})
+        resp = requests.get(YD_API, params={'public_key': url}, timeout = GET_TIMEOUT)
         f = open(os.path.join(output, '_metadata.json'), 'w', encoding='utf8')
         f.write(resp.text)
         f.close()
-    resp = requests.get(YD_API_DOWNLOAD, params={'public_key': url})
+    resp = requests.get(YD_API_DOWNLOAD, params={'public_key': url}, timeout = GET_TIMEOUT)
     data = resp.json()
     id = url.rsplit('/', 1)[-1]
     if output is None:
@@ -132,11 +168,25 @@ def sha256(fname):
 
 
 def yd_get_and_store_dir(url, path, output, nofiles=False, iterative=False):
+    global gotten_dirs, error_dirs, again_files, already_files
     # print(f"requests.get params = {url}, {path}")
-    resp = requests.get(YD_API, params={'public_key': url, 'path' : path, 'limit' : 1000})
+    try:
+        resp = requests.get(YD_API, params={'public_key': url, 'path' : path}, timeout = GET_TIMEOUT)
+        data = resp.json()
+    except Exception as e:
+        logging.warning(f"Connection error {e.__class__} getting directory {url}{path}")
+        error_dirs += [(url, path, e.__class__)]
+        return
     arr = [output, ]
     arr.extend(url_to_dir_list(path))
     os.makedirs(os.path.join(*arr), exist_ok=True)
+    
+    if resp.status_code != requests.status_codes.codes.ALL_OK:
+        logging.warning(f"Error {resp.status_code} getting directory {url}{path} : {resp.text} : {resp.reason}")
+        error_dirs += [(url, path, resp.status_code, resp.text, resp.reason)]
+        return
+    
+    gotten_dirs += 1
     
     if nofiles: # metadata is written to disk only if --nofiles flag is given
         logging.info('Saving metadata of %s' % (os.path.join(os.path.join(*arr))))
@@ -169,7 +219,7 @@ def yd_get_and_store_dir(url, path, output, nofiles=False, iterative=False):
                         # print(f"arr {arr[:-1]}")
                         # print(f"Checking existence of {file_path}")
                         if not os.path.exists(file_path):
-                            get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'])
+                            get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
                             logging.debug('Saved %s' % (row['path']))
                         else:
                             # todo: sha256 of downloaded file
@@ -177,13 +227,16 @@ def yd_get_and_store_dir(url, path, output, nofiles=False, iterative=False):
                             # print(f"local  size = {os.path.getsize(file_path)}, md5 = {md5(file_path)}, sha256 = {sha256(file_path)}")
                             if os.path.getsize(file_path) != int(row['size']):
                                 logging.info(f"File {row['path']} has wrong size, downloading it again..")
-                                get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'])
+                                get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
+                                again_files += 1
                             elif sha256(file_path) != row['sha256']:
                                 # todo: write all wrong files to some file
                                 logging.info(f"File {row['path']} has wrong sha256, downloading it again..")
-                                get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'])
+                                get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
+                                again_files += 1
                             else:
                                 logging.info('Already stored %s' % (row['path']))
+                                already_files += 1
 
         return
 
@@ -229,10 +282,23 @@ class Project:
         yd_get_and_store_dir(url, path, metapath, nofiles=nofiles, iterative=True)
 
     def sync(self, url, output, nofiles=False):
-        self.__store(url, output, nofiles)
+        # self.__store(url, output, nofiles)
+        try:
+            self.__store(url, output, nofiles)
+        except KeyboardInterrupt:
+            print("Interrupted")
+            # sys.exit(0)
+            pass
+
+        print(f"""{gotten_files} files in {gotten_dirs} directories downloaded
+{already_files} files left unchanged
+{again_files} files updated""")
+        if len(error_files) or len(error_dirs):
+            print(f"""{len(error_files)} files and {len(error_dirs)} directories unsuccessful:
+{error_files}
+{error_dirs}""")
         pass
 
     def full(self, url, output, filename, metadata):
         yd_get_full(url, output, filename, metadata)
         pass
-
