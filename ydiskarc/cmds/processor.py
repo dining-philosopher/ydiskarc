@@ -70,7 +70,7 @@ def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2p
         logging.warning(f"Connection error {e.__class__} getting {filename}")
         error_files += [(url, filepath, filename, e.__class__)]
         return
-    
+
     if filename is None:
         if "Content-Disposition" in page.headers.keys():
             fname = re.findall("filename=(.+)", page.headers["Content-Disposition"])[0].strip('"').encode('latin-1').decode('utf-8')
@@ -83,12 +83,12 @@ def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2p
     elif filepath is not None:
             filename = os.path.join(filepath, filename)
     filename = filename.replace("\"","-")
-    
+
     if page.status_code != requests.status_codes.codes.ALL_OK:
         logging.warning(f"Error {page.status_code} getting {filename} : {page.text} : {page.reason}")
         error_files += [(url, filepath, filename, page.status_code, page.text, page.reason)]
         return
-    
+
     if not aria2:
         # filename_tmp = filename + ".ydiskarc_download"
         filename_tmp = filename + ".download"
@@ -102,7 +102,7 @@ def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2p
                     f.write(line)
                 total += len(line)
                 if filesize is not None:
-    #               logging.debug('File %s to size %d' % (filename, total))               
+    #               logging.debug('File %s to size %d' % (filename, total))
                     progress.update(task1, advance=len(line))
                 if chunk % 1000 == 0:
                     logging.debug('File %s to size %d' % (filename, total))
@@ -116,7 +116,7 @@ def get_file(url, filepath=None, filename=None, params=None, aria2=False, aria2p
         os.replace(filename_tmp, filename)
         if filedate:
             set_file_date(filename, filedate)
-        
+
         logging.info('Saved %s' % filename)
         gotten_files += 1
     else:
@@ -169,76 +169,87 @@ def sha256(fname):
 
 def yd_get_and_store_dir(url, path, output, nofiles=False, iterative=False):
     global gotten_dirs, error_dirs, again_files, already_files
-    # print(f"requests.get params = {url}, {path}")
-    try:
-        resp = requests.get(YD_API, params={'public_key': url, 'path' : path}, timeout = GET_TIMEOUT)
-        data = resp.json()
-    except Exception as e:
-        logging.warning(f"Connection error {e.__class__} getting directory {url}{path}")
-        error_dirs += [(url, path, e.__class__)]
-        return
     arr = [output, ]
     arr.extend(url_to_dir_list(path))
     os.makedirs(os.path.join(*arr), exist_ok=True)
-    
-    if resp.status_code != requests.status_codes.codes.ALL_OK:
-        logging.warning(f"Error {resp.status_code} getting directory {url}{path} : {resp.text} : {resp.reason}")
-        error_dirs += [(url, path, resp.status_code, resp.text, resp.reason)]
-        return
-    
-    gotten_dirs += 1
-    
-    if nofiles: # metadata is written to disk only if --nofiles flag is given
-        logging.info('Saving metadata of %s' % (os.path.join(os.path.join(*arr))))
-        f = open(os.path.join(os.path.join(*arr), '_metadata.json'), 'w', encoding='utf8')
-        f.write(resp.text)
-        f.close()
-    
-    if not iterative:
-        return resp.json()
-    else:
-        data = resp.json()
-        if '_embedded' in data.keys():
-            for row in data['_embedded']['items']:
-                if 'path' in row.keys():
-                    if row['type'] == 'dir':
-                        arr = [output,]
-                        arr.extend(url_to_dir_list(path))
-                        row_path = os.path.join(*arr)
-                        os.makedirs(row_path, exist_ok=True)
-                        if iterative:
-                            yd_get_and_store_dir(url, row['path'], output, nofiles, iterative=iterative)
-                    elif row['type'] == 'file':
-                        if nofiles:
-                            continue
-                        arr = [output,]
-                        arr.extend(url_to_dir_list(row['path']))
-                        dir_path = os.path.join(*arr[:-1])
-                        file_path = os.path.join(*arr)
-                        # print(f"row {row['path']}")
-                        # print(f"arr {arr[:-1]}")
-                        # print(f"Checking existence of {file_path}")
-                        if not os.path.exists(file_path):
-                            get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
-                            logging.debug('Saved %s' % (row['path']))
-                        else:
-                            # todo: sha256 of downloaded file
-                            # print(f"server size = {row['size']}, md5 = {row['md5']}, sha256 = {row['sha256']}")
-                            # print(f"local  size = {os.path.getsize(file_path)}, md5 = {md5(file_path)}, sha256 = {sha256(file_path)}")
-                            if os.path.getsize(file_path) != int(row['size']):
-                                logging.info(f"File {row['path']} has wrong size, downloading it again..")
-                                get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
-                                again_files += 1
-                            elif sha256(file_path) != row['sha256']:
-                                # todo: write all wrong files to some file
-                                logging.info(f"File {row['path']} has wrong sha256, downloading it again..")
-                                get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
-                                again_files += 1
-                            else:
-                                logging.info('Already stored %s' % (row['path']))
-                                already_files += 1
+    page_size = 200  # pagination limit to fetch more than default 20 items
+    offset = 0
+    first_page = True
+    while True:
+        logging.info('Paging offset: %s' % offset)
+        try:
+            params = {'public_key': url, 'path': path}
+            if iterative:
+                params.update({'limit': page_size, 'offset': offset})
+            resp = requests.get(YD_API, params=params, timeout=GET_TIMEOUT)
+            data = resp.json()
+        except Exception as e:
+            logging.warning(f"Connection error {e.__class__} getting directory {url}{path}")
+            error_dirs += [(url, path, e.__class__)]
+            return
 
-        return
+        if resp.status_code != requests.status_codes.codes.ALL_OK:
+            logging.warning(f"Error {resp.status_code} getting directory {url}{path} : {resp.text} : {resp.reason}")
+            error_dirs += [(url, path, resp.status_code, resp.text, resp.reason)]
+            return
+
+        if first_page:
+            gotten_dirs += 1
+            if nofiles: # metadata is written to disk only if --nofiles flag is given
+                logging.info('Saving metadata of %s' % (os.path.join(os.path.join(*arr))))
+                f = open(os.path.join(os.path.join(*arr), '_metadata.json'), 'w', encoding='utf8')
+                f.write(resp.text)
+                f.close()
+            if not iterative:
+                return data
+            first_page = False
+
+        embedded = data.get('_embedded', {})
+        items = embedded.get('items', [])
+        for row in items:
+            if 'path' in row.keys():
+                if row['type'] == 'dir':
+                    arr = [output,]
+                    arr.extend(url_to_dir_list(path))
+                    row_path = os.path.join(*arr)
+                    os.makedirs(row_path, exist_ok=True)
+                    if iterative:
+                        yd_get_and_store_dir(url, row['path'], output, nofiles, iterative=iterative)
+                elif row['type'] == 'file':
+                    if nofiles:
+                        continue
+                    arr = [output,]
+                    arr.extend(url_to_dir_list(row['path']))
+                    dir_path = os.path.join(*arr[:-1])
+                    file_path = os.path.join(*arr)
+                    # print(f"row {row['path']}")
+                    # print(f"arr {arr[:-1]}")
+                    # print(f"Checking existence of {file_path}")
+                    if not os.path.exists(file_path):
+                        get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
+                        logging.debug('Saved %s' % (row['path']))
+                    else:
+                        # todo: sha256 of downloaded file
+                        # print(f"server size = {row['size']}, md5 = {row['md5']}, sha256 = {row['sha256']}")
+                        # print(f"local  size = {os.path.getsize(file_path)}, md5 = {md5(file_path)}, sha256 = {sha256(file_path)}")
+                        if os.path.getsize(file_path) != int(row['size']):
+                            logging.info(f"File {row['path']} has wrong size, downloading it again..")
+                            get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
+                            again_files += 1
+                        elif sha256(file_path) != row['sha256']:
+                            # todo: write all wrong files to some file
+                            logging.info(f"File {row['path']} has wrong sha256, downloading it again..")
+                            get_file(row['file'], dir_path, filename=arr[-1], filesize=row['size'], filedate = row["modified"])
+                            again_files += 1
+                        else:
+                            logging.info('Already stored %s' % (row['path']))
+                            already_files += 1
+
+        if len(items) < page_size:
+            break
+        offset += page_size
+
+    return
 
 class Project:
     """Disk files extractor. Yandex.Disk only right now"""
